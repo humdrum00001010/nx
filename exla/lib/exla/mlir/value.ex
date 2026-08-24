@@ -701,7 +701,8 @@ defmodule EXLA.MLIR.Value do
         [%Value{} = callback_pid | leaf_operands],
         leaf_typespecs,
         callback_id,
-        num_aliased_data_outputs \\ 0
+        num_aliased_data_outputs \\ 0,
+        per_partition? \\ false
       ) do
     [%Value{function: func} | _] = [callback_pid | leaf_operands]
     result_types = typespecs_to_mlir_types(leaf_typespecs)
@@ -741,6 +742,19 @@ defmodule EXLA.MLIR.Value do
       ]
 
     attributes =
+      if per_partition? do
+        callback_pid_typespec = get_typespec(callback_pid)
+
+        Keyword.put(
+          attributes,
+          :"sdy.sharding_rule",
+          per_partition_io_call_sharding_rule(callback_pid_typespec, leaf_typespecs)
+        )
+      else
+        attributes
+      end
+
+    attributes =
       if aliases != [] do
         Keyword.put(attributes, :output_operand_aliases, join_list(aliases))
       else
@@ -751,6 +765,47 @@ defmodule EXLA.MLIR.Value do
       attributes: attributes
     )
   end
+
+  defp per_partition_io_call_sharding_rule(
+         %Typespec{shape: callback_pid_shape},
+         [%Typespec{shape: data_shape}]
+       ) do
+    {pid_factors, next_index} = sharding_rule_factors(callback_pid_shape, 0)
+    {data_factors, _next_index} = sharding_rule_factors(data_shape, next_index)
+
+    operand_mappings =
+      "(" <> factor_mapping(pid_factors) <> ", " <> factor_mapping(data_factors) <> ")"
+
+    result_mappings = "(" <> factor_mapping(data_factors) <> ")"
+    factor_sizes = factor_sizes(pid_factors ++ data_factors)
+    replicated = factor_names(pid_factors)
+
+    "#sdy.op_sharding_rule<#{operand_mappings}->#{result_mappings} " <>
+      "{#{factor_sizes}} need_replication={#{replicated}}, custom>"
+  end
+
+  defp sharding_rule_factors(shape, start_index) do
+    shape
+    |> Tuple.to_list()
+    |> Enum.map_reduce(start_index, fn size, index ->
+      {{sharding_rule_factor_name(index), size}, index + 1}
+    end)
+  end
+
+  defp sharding_rule_factor_name(index) when index <= 17,
+    do: <<?i + index>>
+
+  defp sharding_rule_factor_name(index), do: "z_#{index - 17}"
+
+  defp factor_mapping(factors) do
+    "[" <> Enum.map_join(factors, ", ", &elem(&1, 0)) <> "]"
+  end
+
+  defp factor_sizes(factors) do
+    Enum.map_join(factors, ", ", fn {name, size} -> "#{name}=#{size}" end)
+  end
+
+  defp factor_names(factors), do: Enum.map_join(factors, ", ", &elem(&1, 0))
 
   def call(%Function{} = func, args, %Function{} = computation, typespecs) do
     result_types = typespecs_to_mlir_types(typespecs)

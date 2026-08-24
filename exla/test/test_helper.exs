@@ -20,6 +20,11 @@ Nx.Defn.global_default_options(compiler: EXLA)
 exclude_multi_device =
   if client.device_count > 1 and client.platform == :host, do: [], else: [:multi_device]
 
+exclude_spmd_callback =
+  if client.device_count > 1 and client.platform in [:host, :cuda],
+    do: [],
+    else: [:spmd_callback]
+
 exclude =
   case client.platform do
     :tpu -> [:unsupported_dilated_window_reduce, :unsupported_64_bit_op]
@@ -74,7 +79,8 @@ distributed_exclude =
 ExUnit.start(
   exclude:
     [:platform, :integration] ++
-      exclude_multi_device ++ exclude ++ cuda_required ++ distributed_exclude,
+      exclude_multi_device ++
+      exclude_spmd_callback ++ exclude ++ cuda_required ++ distributed_exclude,
   include: [platform: String.to_atom(target)],
   assert_receive_timeout: 1000
 )

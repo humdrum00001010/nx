@@ -597,21 +597,33 @@ FINE_NIF(get_supported_platforms, 0);
 
 // ExlaExecutable Functions
 
+void stop_callback_server(const std::optional<ErlNifPid> &callback_server_pid) {
+  if (!callback_server_pid.has_value()) {
+    return;
+  }
+
+  auto pid = callback_server_pid.value();
+  auto msg_env = enif_alloc_env();
+  enif_send(msg_env, &pid, msg_env, fine::encode(msg_env, exla::atoms::stop));
+  enif_free_env(msg_env);
+}
+
 ExlaExecutable::RunResult run(ErlNifEnv *env,
                               fine::ResourcePtr<ExlaExecutable> executable,
                               ExlaExecutable::RunArguments arguments,
                               int64_t device_id,
                               std::optional<ErlNifPid> callback_server_pid) {
-  auto result = unwrap(executable->Run(env, arguments, device_id));
-
-  if (callback_server_pid.has_value()) {
-    auto pid = callback_server_pid.value();
-    auto msg_env = enif_alloc_env();
-    enif_send(msg_env, &pid, msg_env, fine::encode(msg_env, exla::atoms::stop));
-    enif_free_env(msg_env);
+  try {
+    auto result = unwrap(executable->Run(env, arguments, device_id));
+    stop_callback_server(callback_server_pid);
+    return result;
+  } catch (...) {
+    // A callback failure can abort one partition while other partitions still
+    // have callback replies in flight. Keep the server alive until Execute has
+    // unwound, then stop it on both success and failure.
+    stop_callback_server(callback_server_pid);
+    throw;
   }
-
-  return result;
 }
 
 ExlaExecutable::RunResult

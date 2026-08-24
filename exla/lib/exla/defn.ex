@@ -157,6 +157,12 @@ defmodule EXLA.Defn do
     {executable, {used_inputs, outputs, outfeed, _input_typespecs?}} =
       compile(key, vars, fun, compile_options, 0, [], callback)
 
+    is_sharded? = !!options[:mesh]
+
+    if is_sharded? and Outfeed.has_infeed_flags(outfeed) do
+      raise ArgumentError, "infeed is not supported for sharded execution yet"
+    end
+
     if compile_options[:module_compilation] == :to_mlir do
       throw({:mlir_module, executable.ref, MapSet.new(Map.keys(used_inputs)), outputs})
     end
@@ -171,16 +177,20 @@ defmodule EXLA.Defn do
 
       {time, res} =
         :timer.tc(fn ->
-          maybe_outfeed(
-            lock,
-            executable,
-            args,
-            used_inputs,
-            outputs,
-            outfeed,
-            run_options,
-            !!options[:mesh]
-          )
+          try do
+            maybe_outfeed(
+              lock,
+              executable,
+              args,
+              used_inputs,
+              outputs,
+              outfeed,
+              run_options,
+              is_sharded?
+            )
+          after
+            safe_unlock(lock)
+          end
         end)
 
       debug? &&
@@ -188,6 +198,12 @@ defmodule EXLA.Defn do
 
       res
     end
+  end
+
+  defp safe_unlock(lock) do
+    EXLA.Defn.Lock.unlock(lock)
+  catch
+    _, _ -> :ok
   end
 
   defp to_computation(
@@ -215,7 +231,8 @@ defmodule EXLA.Defn do
       builder: function,
       params: Map.new(params ++ outfeed.infeeds),
       scope_ids: Tree.scope_ids(expr),
-      callback_pid_value: callback_pid_value
+      callback_pid_value: callback_pid_value,
+      sharded?: !!options[:mesh]
     }
 
     {res, cache} = recur_flatten(expr, state, new_cache(outfeed))
@@ -235,44 +252,55 @@ defmodule EXLA.Defn do
          is_sharded?
        )
        when Outfeed.has_infeed_flags(outfeed) or Outfeed.has_callbacks(outfeed) do
-    if is_sharded? do
-      raise ArgumentError, "outfeed is not supported for sharded execution yet"
-    end
+    {input_lists, infeeds} =
+      if is_sharded? do
+        input_lists =
+          Enum.map(args, fn partition_args ->
+            EXLA.Defn.Buffers.filter_by_indexes(partition_args, used_inputs, fn arg, _i ->
+              EXLA.Defn.Buffers.from_nx!(arg, executable)
+            end)
+          end)
 
-    {buffers, infeeds} =
-      EXLA.Defn.Buffers.split_by_value(args, used_inputs, fn
-        arg, _i, nil -> EXLA.Defn.Buffers.from_nx!(arg, executable, true)
-        arg, i, _depth -> {i, EXLA.Defn.Buffers.from_nx!(arg, executable, false)}
-      end)
+        {input_lists, %{}}
+      else
+        {buffers, infeeds} =
+          EXLA.Defn.Buffers.split_by_value(args, used_inputs, fn
+            arg, _i, nil -> EXLA.Defn.Buffers.from_nx!(arg, executable, true)
+            arg, i, _depth -> {i, EXLA.Defn.Buffers.from_nx!(arg, executable, false)}
+          end)
 
-    infeeds = Map.new(infeeds)
+        {[Enum.reverse(buffers)], Map.new(infeeds)}
+      end
 
     {:ok, outfeed_pid} =
       Outfeed.start_child(executable, outfeed, Process.group_leader(), infeeds)
 
     ref = Process.monitor(outfeed_pid)
-
     run_options = Keyword.put(run_options, :callback_server_pid, outfeed_pid)
 
-    {:ok, runner} =
-      EXLA.Defn.Runner.start_link(lock, fn ->
-        EXLA.Executable.run(executable, [Enum.reverse(buffers)], run_options)
+    runner =
+      start_runner_before_transfer!(outfeed_pid, ref, lock, fn ->
+        EXLA.Executable.run(executable, input_lists, run_options)
       end)
 
-    _ = EXLA.Defn.Lock.transfer(lock, fn -> send(runner, lock) end, outfeed_pid)
+    try do
+      _ = EXLA.Defn.Lock.transfer(lock, fn -> send(runner, lock) end, outfeed_pid)
+    catch
+      kind, reason ->
+        stop_pretransfer_processes(outfeed_pid, ref, runner)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
 
     receive do
       {:DOWN, ^ref, _, _, _} ->
-        results = EXLA.Defn.Runner.read(runner)
-
-        Enum.map(results, fn result ->
-          EXLA.Defn.Buffers.to_nx!(result, outputs, executable.mesh)
-        end)
+        runner
+        |> EXLA.Defn.Runner.read()
+        |> Enum.map(&EXLA.Defn.Buffers.to_nx!(&1, outputs, executable.mesh))
     end
   end
 
   defp maybe_outfeed(
-         lock,
+         _lock,
          executable,
          args,
          used_inputs,
@@ -281,26 +309,47 @@ defmodule EXLA.Defn do
          run_options,
          is_sharded?
        ) do
-    try do
-      args = if is_sharded?, do: args, else: [args]
+    args = if is_sharded?, do: args, else: [args]
 
-      # Check if args are pre-sliced (list of arglists for each partition)
-      input_lists =
-        Enum.map(args, fn partition_args ->
-          EXLA.Defn.Buffers.filter_by_indexes(partition_args, used_inputs, fn arg, _i ->
-            EXLA.Defn.Buffers.from_nx!(arg, executable)
-          end)
+    input_lists =
+      Enum.map(args, fn partition_args ->
+        EXLA.Defn.Buffers.filter_by_indexes(partition_args, used_inputs, fn arg, _i ->
+          EXLA.Defn.Buffers.from_nx!(arg, executable)
         end)
+      end)
 
-      EXLA.Executable.run(executable, input_lists, run_options)
-    else
-      [_ | _] = results ->
-        # For sharded execution, we get a list of results (one per partition)
-        Enum.map(results, fn result ->
-          EXLA.Defn.Buffers.to_nx!(result, outputs, executable.mesh)
-        end)
-    after
-      EXLA.Defn.Lock.unlock(lock)
+    executable
+    |> EXLA.Executable.run(input_lists, run_options)
+    |> Enum.map(&EXLA.Defn.Buffers.to_nx!(&1, outputs, executable.mesh))
+  end
+
+  defp start_runner_before_transfer!(outfeed_pid, ref, lock, fun) do
+    runner_result =
+      try do
+        EXLA.Defn.Runner.start_link(lock, fun)
+      catch
+        kind, reason ->
+          stop_pretransfer_processes(outfeed_pid, ref, nil)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case runner_result do
+      {:ok, runner} ->
+        runner
+
+      other ->
+        stop_pretransfer_processes(outfeed_pid, ref, nil)
+        raise MatchError, term: other
+    end
+  end
+
+  defp stop_pretransfer_processes(outfeed_pid, ref, runner) do
+    Process.demonitor(ref, [:flush])
+    send(outfeed_pid, :stop)
+
+    if runner do
+      Process.unlink(runner)
+      Process.exit(runner, :kill)
     end
   end
 
@@ -907,11 +956,29 @@ defmodule EXLA.Defn do
              args: [tensor_expr, callback_spec, _template, _ref]
            }
          } = io_call_expr,
-         %{client: %EXLA.Client{platform: platform}, callback_pid_value: callback_pid_value} =
-           state,
+         %{
+           client: %EXLA.Client{platform: platform},
+           callback_pid_value: callback_pid_value,
+           sharded?: sharded?
+         } = state,
          cache
        )
        when platform in [:host, :cuda] do
+    if sharded? do
+      case tensor_expr do
+        %T{vectorized_axes: []} ->
+          :ok
+
+        %T{} ->
+          raise ArgumentError, "sharded io_call does not support vectorized tensors"
+
+        _ ->
+          raise ArgumentError,
+                "sharded io_call supports a single tensor, got: " <>
+                  inspect(Nx.to_template(tensor_expr))
+      end
+    end
+
     {reverse_arg_values, reverse_typespecs, cache, num_aliased} =
       Composite.reduce(tensor_expr, {[], [], cache, 0}, fn %T{} = expr,
                                                            {acc, typespecs, cache, num_aliased} ->
@@ -923,14 +990,15 @@ defmodule EXLA.Defn do
     leaf_typespecs = Enum.reverse(reverse_typespecs)
     arg_template = Nx.to_template(tensor_expr)
 
-    cache = add_callback(cache, {id, callback_spec, nil, arg_template})
+    callback_opts = if sharded?, do: {:io_call, :per_partition}, else: nil
+    cache = add_callback(cache, {id, callback_spec, nil, arg_template, callback_opts})
 
     unless callback_pid_value do
       raise "internal bug: io_call callback pid operand is missing"
     end
 
-    aliased_outputs =
-      Value.host_callback([callback_pid_value | arg_values], leaf_typespecs, id, num_aliased)
+    args = [callback_pid_value | arg_values]
+    aliased_outputs = Value.host_callback(args, leaf_typespecs, id, num_aliased, sharded?)
 
     {wrap_tuple_result(aliased_outputs, io_call_expr), cache}
   end
@@ -951,11 +1019,18 @@ defmodule EXLA.Defn do
   defp cached_recur_operator(
          :runtime_call,
          %T{data: %Expr{id: id, args: [tensor_expr, fun, out_template, opts]}} = expr,
-         %{client: %EXLA.Client{platform: platform}, callback_pid_value: callback_pid_value} =
-           state,
+         %{
+           client: %EXLA.Client{platform: platform},
+           callback_pid_value: callback_pid_value,
+           sharded?: sharded?
+         } = state,
          cache
        )
        when platform in [:host, :cuda] do
+    if sharded? do
+      raise ArgumentError, "Nx.runtime_call is not supported for sharded execution"
+    end
+
     tensor_exprs = Composite.flatten_list([tensor_expr])
 
     {arg_values, cache} =

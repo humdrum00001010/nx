@@ -244,10 +244,18 @@ defmodule EXLA.Defn.Outfeed do
     ref = make_ref()
     typespec = EXLA.Typespec.tensor({:u, 16}, {})
 
-    loop(client, device_id, ref, typespec, infeed_flags, infeeds, callbacks)
+    loop(client, device_id, ref, typespec, infeed_flags, infeeds, {:ok, callbacks})
   end
 
-  defp loop(client, device_id, ref, typespec, infeed_flags, infeeds, callbacks) do
+  defp loop(
+         client,
+         device_id,
+         ref,
+         typespec,
+         infeed_flags,
+         infeeds,
+         callback_state
+       ) do
     if active_infeed_flags?(infeed_flags) do
       :ok = EXLA.Client.from_outfeed(client, device_id, [typespec], self(), ref)
     end
@@ -262,7 +270,7 @@ defmodule EXLA.Defn.Outfeed do
           typespec,
           drop_infeed_flags(infeed_flags),
           infeeds,
-          callbacks
+          callback_state
         )
 
       {^ref, <<flag::native-unsigned-16>>} ->
@@ -276,19 +284,46 @@ defmodule EXLA.Defn.Outfeed do
 
             EXLA.Client.to_infeed(client, device_id, [{data, data_typespec}])
 
-            loop(client, device_id, ref, typespec, infeed_flags, infeeds, callbacks)
+            loop(
+              client,
+              device_id,
+              ref,
+              typespec,
+              infeed_flags,
+              infeeds,
+              callback_state
+            )
         end
 
       {:exla_runtime_call, callback_id, args_spec, reply_tag} ->
-        send_callback_reply(callbacks, callback_id, args_spec, reply_tag)
-        loop(client, device_id, ref, typespec, infeed_flags, infeeds, callbacks)
+        callback_state =
+          reply_runtime_callback(callback_state, callback_id, args_spec, reply_tag)
+
+        loop(
+          client,
+          device_id,
+          ref,
+          typespec,
+          infeed_flags,
+          infeeds,
+          callback_state
+        )
 
       :stop ->
         :ok
 
       other ->
         Logger.debug("EXLA.Outfeed ignoring unexpected message: #{inspect(other)}")
-        loop(client, device_id, ref, typespec, infeed_flags, infeeds, callbacks)
+
+        loop(
+          client,
+          device_id,
+          ref,
+          typespec,
+          infeed_flags,
+          infeeds,
+          callback_state
+        )
     end
   end
 
@@ -314,6 +349,18 @@ defmodule EXLA.Defn.Outfeed do
     end
   end
 
+  defp reply_runtime_callback({:ok, callbacks}, callback_id, args_spec, reply_tag) do
+    case send_callback_reply(callbacks, callback_id, args_spec, reply_tag) do
+      {:ok, _payload} -> {:ok, callbacks}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp reply_runtime_callback({:error, _reason} = error, _callback_id, _args_spec, reply_tag) do
+    deliver_native_reply(reply_tag, error)
+    error
+  end
+
   defp send_callback_reply(callbacks, callback_id, args_spec, reply_tag) do
     reply =
       try do
@@ -331,19 +378,18 @@ defmodule EXLA.Defn.Outfeed do
             encode_callback_reply({:error, :unknown_callback})
 
           {:error, _} = error ->
-            error
+            encode_callback_reply(error)
         end
       rescue
         exception ->
-          send(self(), :stop)
           {:error, {:exception, Exception.format(:error, exception, __STACKTRACE__)}}
       catch
         kind, reason ->
-          send(self(), :stop)
           {:error, {kind, Exception.format(kind, reason, __STACKTRACE__)}}
       end
 
     deliver_native_reply(reply_tag, reply)
+    reply
   end
 
   defp deliver_native_reply(reply_tag, reply) do
@@ -422,6 +468,25 @@ defmodule EXLA.Defn.Outfeed do
     end
   end
 
+  defp materialize_callback_args(
+         {_, nil, %Nx.Tensor{} = template, {:io_call, :per_partition}},
+         [{bin, {type, shape_list}}]
+       ) do
+    decoded =
+      bin
+      |> Nx.from_binary(type)
+      |> Nx.reshape(List.to_tuple(shape_list))
+
+    if decoded.type == template.type and tuple_size(decoded.shape) == tuple_size(template.shape) do
+      {:ok, decoded}
+    else
+      {:error, {:local_shape_mismatch, decoded, template}}
+    end
+  rescue
+    exception ->
+      {:error, {:decode_failed, exception}}
+  end
+
   defp materialize_callback_args({_, _, arg_template, _}, args_spec) when is_list(args_spec) do
     materialize_callback_tensors(arg_template, args_spec)
   catch
@@ -448,6 +513,14 @@ defmodule EXLA.Defn.Outfeed do
     msg =
       "expected the runtime_call function to return a value compatible with the output " <>
         "template #{inspect(right)}, got: #{inspect(left)}"
+
+    raise ArgumentError.exception(msg)
+  end
+
+  defp encode_callback_reply({:error, {:local_shape_mismatch, left, right}}) do
+    msg =
+      "expected a per-partition io_call value with type #{inspect(right.type)} and " <>
+        "rank #{tuple_size(right.shape)}, got: #{inspect(left)}"
 
     raise ArgumentError.exception(msg)
   end
