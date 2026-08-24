@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Enhancements
+
+  * Add synchronous per-partition `Nx.io_call` support to
+    `EXLA.shard_jit/3` on Host and CUDA clients
+
 ## v0.13.1 (2026-08-10)
 
 ### Bug fixes

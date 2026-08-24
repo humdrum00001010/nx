@@ -380,6 +380,14 @@ defmodule EXLA do
         - `[%{0 => [0, 1]}]` - shard dim 0 across both mesh axes 0 and 1
         - `[%{}]` - fully replicated tensor
 
+  On Host and CUDA clients, `Nx.io_call` accepts one non-vectorized tensor and runs
+  once per partition with its physical local buffer. Uneven partitioning may expose
+  XLA padding, so summaries must mask invalid elements. One host server serializes
+  callbacks in unspecified arrival order; there is no aggregation, collective, or
+  all-partition barrier. The first error fails the run and may skip later callback
+  bodies. `Nx.runtime_call` remains unsupported. Every callback synchronizes its
+  local device stream and copies to host, so use it only for bounded diagnostics.
+
   Also accepts the same options as `compile/3`.
   """
   def shard_jit(function, %Nx.Mesh{} = mesh, options \\ []) when is_list(options) do
